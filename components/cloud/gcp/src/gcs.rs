@@ -11,6 +11,12 @@ use futures_util::{
     io::{self as async_io, AsyncRead, Cursor},
     stream::{StreamExt, TryStreamExt},
 };
+use google_cloud_auth::{
+    credentials::CredentialsFile,
+    project::{create_token_source, create_token_source_from_project, Project, ProjectInfo},
+    token::{self, DefaultTokenSourceProvider},
+    token_source::TokenSource,
+};
 use http::HeaderValue;
 use hyper::{client::HttpConnector, Body, Client, Request, Response, StatusCode};
 use hyper_tls::HttpsConnector;
@@ -20,7 +26,6 @@ use tame_gcs::{
     objects::{InsertObjectOptional, Metadata, Object},
     types::{BucketName, ObjectId},
 };
-use tame_oauth::gcp::{ServiceAccountAccess, ServiceAccountInfo, TokenOrRequest};
 use tikv_util::{
     stream::{error_stream, AsyncReadAsSyncStreamOfBytes, RetryError},
     time::Instant,
@@ -36,7 +41,7 @@ pub struct Config {
     bucket: BucketConf,
     predefined_acl: Option<PredefinedAcl>,
     storage_class: Option<StorageClass>,
-    svc_info: Option<ServiceAccountInfo>,
+    token_source: Option<Box<dyn TokenSource>>,
 }
 
 impl Config {
@@ -46,7 +51,7 @@ impl Config {
             bucket,
             predefined_acl: None,
             storage_class: None,
-            svc_info: None,
+            token_source: None,
         }
     }
 
@@ -69,16 +74,26 @@ impl Config {
                 .unwrap_or(&"".to_string())
                 .to_string(),
         );
-        let svc_info = if let Some(cred) = credentials_blob_opt {
-            Some(deserialize_service_account_info(cred)?)
+
+        let project = if let Some(cred) = credentials_blob_opt {
+            Project::FromFile(deserialize_credentials(cred)?)
         } else {
-            None
+            Project::FromMetadataServer(ProjectInfo { project_id: None })
         };
+
+        let token_source = create_token_source_from_project(
+            &project,
+            google_cloud_auth::project::Config {
+                audience: todo!(),
+                scopes: todo!(),
+            },
+        )
+        .await?;
 
         Ok(Config {
             bucket,
             predefined_acl,
-            svc_info,
+            token_source: Some(token_source),
             storage_class,
         })
     }
@@ -96,25 +111,43 @@ impl Config {
             .or_invalid_input("invalid predefined_acl")?;
         let storage_class = parse_storage_class(&none_to_empty(bucket.storage_class.clone()))
             .or_invalid_input("invalid storage_class")?;
-        let svc_info = if let Some(cred) = StringNonEmpty::opt(input.credentials_blob) {
-            Some(deserialize_service_account_info(cred)?)
+
+        let credentials_blob_opt = StringNonEmpty::opt(
+            attrs
+                .get("credentials_blob")
+                .unwrap_or(&"".to_string())
+                .to_string(),
+        );
+
+        let project = if let Some(cred) = credentials_blob_opt {
+            Project::FromFile(deserialize_credentials(cred)?)
         } else {
-            None
+            Project::FromMetadataServer(ProjectInfo { project_id: None })
         };
+
+        let token_source = create_token_source_from_project(
+            &project,
+            google_cloud_auth::project::Config {
+                audience: todo!(),
+                scopes: todo!(),
+            },
+        )
+        .await?;
+
         Ok(Config {
             bucket,
             predefined_acl,
-            svc_info,
+            token_source: Some(token_source),
             storage_class,
         })
     }
 }
 
-fn deserialize_service_account_info(
+fn deserialize_credentials(
     cred: StringNonEmpty,
-) -> std::result::Result<ServiceAccountInfo, RequestError> {
-    ServiceAccountInfo::deserialize(cred.to_string())
-        .map_err(|e| RequestError::OAuth(e, "deserialize ServiceAccountInfo".to_string()))
+) -> std::result::Result<CredentialsFile, RequestError> {
+    serde_json::from_slice(cred.to_string())
+        .map_err(|e| RequestError::OAuth(e, "deserialize CredentialsFile".to_string()))
 }
 
 impl BlobConfig for Config {
@@ -136,7 +169,7 @@ impl BlobConfig for Config {
 #[derive(Clone)]
 pub struct GcsStorage {
     config: Config,
-    svc_access: Option<Arc<ServiceAccountAccess>>,
+    token_source: Option<Arc<Box<dyn TokenSource>>>,
     client: Client<HttpsConnector<HttpConnector>, Body>,
 }
 
@@ -247,19 +280,10 @@ impl GcsStorage {
 
     /// Create a new GCS storage for the given config.
     pub fn new(config: Config) -> io::Result<GcsStorage> {
-        let svc_access = if let Some(si) = &config.svc_info {
-            Some(
-                ServiceAccountAccess::new(si.clone())
-                    .or_invalid_input("invalid credentials_blob")?,
-            )
-        } else {
-            None
-        };
-
         let client = Client::builder().build(HttpsConnector::new());
         Ok(GcsStorage {
             config,
-            svc_access: svc_access.map(Arc::new),
+            token_source: config.token_source.map(Arc::new),
             client,
         })
     }
@@ -275,44 +299,15 @@ impl GcsStorage {
         &self,
         req: &mut Request<Body>,
         scope: tame_gcs::Scopes,
-        svc_access: Arc<ServiceAccountAccess>,
+        token_source: Box<dyn TokenSource>,
     ) -> Result<(), RequestError> {
-        let token_or_request = svc_access
-            .get_token(&[scope])
-            .map_err(|e| RequestError::OAuth(e, "get_token".to_string()))?;
-        let token = match token_or_request {
-            TokenOrRequest::Token(token) => token,
-            TokenOrRequest::Request {
-                request,
-                scope_hash,
-                ..
-            } => {
-                let res = self
-                    .client
-                    .request(request.map(From::from))
-                    .await
-                    .map_err(|e| RequestError::Hyper(e, "set auth request".to_owned()))?;
-                if !res.status().is_success() {
-                    return Err(status_code_error(
-                        res.status(),
-                        "set auth request".to_string(),
-                    ));
-                }
-                let (parts, body) = res.into_parts();
-                let body = hyper::body::to_bytes(body)
-                    .await
-                    .map_err(|e| RequestError::Hyper(e, "set auth body".to_owned()))?;
-                svc_access
-                    .parse_token_response(scope_hash, Response::from_parts(parts, body))
-                    .map_err(|e| RequestError::OAuth(e, "set auth parse token".to_string()))?
-            }
-        };
-        req.headers_mut().insert(
-            http::header::AUTHORIZATION,
-            token
-                .try_into()
-                .map_err(|e| RequestError::OAuth(e, "set auth add auth header".to_string()))?,
-        );
+        let token = token_source
+            .token()
+            .await
+            .map_err(|e| RequestError::OAuth(e, "get token".to_string()))?;
+
+        req.headers_mut()
+            .insert(http::header::AUTHORIZATION, token.value());
 
         Ok(())
     }
@@ -332,9 +327,10 @@ impl GcsStorage {
             }
         }
 
-        if let Some(svc_access) = &self.svc_access {
-            self.set_auth(&mut req, scope, svc_access.clone()).await?;
+        if let Some(token_source) = &self.token_source {
+            self.set_auth(&mut req, scope, token_source).await?;
         }
+
         let uri = req.uri().to_string();
         let res = self
             .client
